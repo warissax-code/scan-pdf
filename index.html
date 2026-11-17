@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>สแกนเอกสาร</title>
+<meta name="description" content="สแกนเอกสารเป็น PDF ใช้งานออฟไลน์">
+<meta name="theme-color" content="#1f5fbf">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="สแกน PDF">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- ===== จอรายการหน้า ===== -->
+<section id="screen-list" class="screen active">
+  <header class="topbar">
+    <h1>สแกนเอกสาร</h1>
+    <button id="btn-clear" class="btn-text danger" hidden>ล้างทั้งหมด</button>
+  </header>
+  <main class="content">
+    <div id="empty" class="empty">
+      <div class="empty-icon">📄</div>
+      <p>ยังไม่มีหน้าเอกสาร</p>
+      <p class="muted">กด <b>ถ่ายภาพ</b> เพื่อเริ่มสแกน<br>หรือเลือกรูปจากคลังรูปภาพ</p>
+    </div>
+    <ol id="pages" class="pages"></ol>
+  </main>
+  <footer class="bottombar">
+    <button id="btn-gallery" class="btn secondary">🖼️ คลังรูป</button>
+    <button id="btn-camera" class="btn primary big">📷 ถ่ายภาพ</button>
+    <button id="btn-export" class="btn accent" disabled>📄 PDF</button>
+  </footer>
+</section>
+
+<!-- ===== จอปรับขอบ ===== -->
+<section id="screen-crop" class="screen">
+  <header class="topbar">
+    <button id="crop-cancel" class="btn-text">ยกเลิก</button>
+    <h1>ปรับขอบเอกสาร</h1>
+    <span class="spacer"></span>
+  </header>
+  <main class="stage" id="crop-stage">
+    <canvas id="crop-canvas"></canvas>
+    <svg id="crop-svg"></svg>
+    <canvas id="loupe" width="120" height="120"></canvas>
+  </main>
+  <footer class="bottombar">
+    <button id="crop-full" class="btn secondary">ทั้งภาพ</button>
+    <button id="crop-auto" class="btn secondary">หาขอบอัตโนมัติ</button>
+    <button id="crop-ok" class="btn primary">ถัดไป ›</button>
+  </footer>
+</section>
+
+<!-- ===== จอฟิลเตอร์/ตรวจหน้า ===== -->
+<section id="screen-edit" class="screen">
+  <header class="topbar">
+    <button id="edit-back" class="btn-text">‹ ขอบ</button>
+    <h1 id="edit-title">หน้า</h1>
+    <button id="edit-delete" class="btn-text danger">ลบ</button>
+  </header>
+  <main class="stage">
+    <img id="edit-img" alt="ตัวอย่างหน้าเอกสาร">
+    <div id="edit-busy" class="busy" hidden><div class="spinner"></div></div>
+  </main>
+  <div class="filters" id="filters">
+    <button data-f="color">สีปกติ</button>
+    <button data-f="enhance">สีคมชัด</button>
+    <button data-f="gray">ขาวเทา</button>
+    <button data-f="bw">ขาวดำ</button>
+    <button data-f="original">ภาพถ่าย</button>
+  </div>
+  <footer class="bottombar">
+    <button id="edit-rotate" class="btn secondary">↻ หมุน</button>
+    <button id="edit-more" class="btn secondary">+ ถ่ายต่อ</button>
+    <button id="edit-done" class="btn primary">เสร็จ ✓</button>
+  </footer>
+</section>
+
+<!-- ===== แผ่นส่งออก PDF ===== -->
+<div id="export-sheet" class="sheet-wrap" hidden>
+  <div class="sheet">
+    <h2>สร้างไฟล์ PDF</h2>
+    <label class="field">ชื่อไฟล์
+      <input id="pdf-name" type="text" autocomplete="off">
+    </label>
+    <div class="field">ขนาดกระดาษ
+      <div class="seg" id="seg-paper">
+        <button data-v="a4" class="on">A4</button>
+        <button data-v="letter">Letter</button>
+        <button data-v="fit">พอดีรูป</button>
+      </div>
+    </div>
+    <div class="field">คุณภาพ / ขนาดไฟล์
+      <div class="seg" id="seg-quality">
+        <button data-v="low">เล็ก</button>
+        <button data-v="mid" class="on">กลาง</button>
+        <button data-v="high">ชัดสุด</button>
+      </div>
+    </div>
+    <p id="pdf-info" class="muted"></p>
+    <div class="sheet-actions">
+      <button id="pdf-make" class="btn primary big">สร้าง PDF</button>
+      <button id="pdf-share" class="btn accent big" hidden>บันทึก / แชร์ไฟล์</button>
+      <a id="pdf-open" class="btn secondary" hidden target="_blank" rel="noopener">เปิดดูไฟล์</a>
+      <button id="pdf-close" class="btn-text">ปิด</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<div id="global-busy" class="busy full" hidden><div class="spinner"></div><p id="busy-text">กำลังประมวลผล…</p></div>
+
+<input id="file-camera" type="file" accept="image/*" capture="environment" hidden>
+<input id="file-gallery" type="file" accept="image/*" multiple hidden>
+
+<script src="scan.js"></script>
+<script src="pdf.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
