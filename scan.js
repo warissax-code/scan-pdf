@@ -206,7 +206,154 @@
     return { quad: refineQuad(o, comp, w, h, inset || 0), score: ratio + fill * 0.5 };
   }
 
-  function detect(canvas) {
+  /* ---------- วิธีหลัก: หาเส้นตรงด้วย Hough แล้วเลือก 4 เส้นที่เป็นกรอบกระดาษ ----------
+     ใช้ได้ดีแม้กระดาษขาววางบนพื้นขาว เพราะอาศัยเส้นขอบ/เงาที่เป็นเส้นตรงยาว */
+  function edgeMap(b, w, h) {
+    const mag = new Float32Array(w * h), ang = new Float32Array(w * h);
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const gx = -b[i - w - 1] - 2 * b[i - 1] - b[i + w - 1] + b[i - w + 1] + 2 * b[i + 1] + b[i + w + 1];
+      const gy = -b[i - w - 1] - 2 * b[i - w] - b[i - w + 1] + b[i + w - 1] + 2 * b[i + w] + b[i + w + 1];
+      mag[i] = Math.hypot(gx, gy); ang[i] = Math.atan2(gy, gx);
+    }
+    // non-maximum suppression ให้เส้นบางเหลือ 1 พิกเซล
+    const edge = new Uint8Array(w * h);
+    const sorted = Float32Array.from(mag).sort();
+    const T = Math.max(5, sorted[Math.floor(sorted.length * 0.985)] * 0.03); // ต่ำพอให้เห็นขอบจาง ๆ ของกระดาษขาวบนพื้นขาว
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x, m = mag[i];
+      if (m < T) continue;
+      const a = ang[i], dx = Math.round(Math.cos(a)), dy = Math.round(Math.sin(a));
+      if (m >= mag[i + dy * w + dx] && m >= mag[i - dy * w - dx]) edge[i] = 1;
+    }
+    return { edge, ang, mag, T };
+  }
+
+  function lineIntersect(a, b) { // เส้นในรูป x*cos + y*sin = r
+    const det = a.c * b.s - a.s * b.c;
+    if (Math.abs(det) < 1e-6) return null;
+    return [(a.r * b.s - a.s * b.r) / det, (a.c * b.r - a.r * b.c) / det];
+  }
+
+  function detectLines(canvas, maxSide, prev) {
+    const { g, w, h } = grayOf(canvas, maxSide);
+    const b = blur(g, w, h);
+    const { edge, ang } = edgeMap(b, w, h);
+    const NT = 180, D = Math.ceil(Math.hypot(w, h)), NR = 2 * D + 1;
+    const acc = new Int32Array(NT * NR);
+    const cosT = new Float32Array(NT), sinT = new Float32Array(NT);
+    for (let t = 0; t < NT; t++) { cosT[t] = Math.cos(t * Math.PI / NT); sinT[t] = Math.sin(t * Math.PI / NT); }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x; if (!edge[i]) continue;
+      let t0 = Math.round(ang[i] * 180 / Math.PI); t0 = ((t0 % 180) + 180) % 180;
+      for (let dt = -4; dt <= 4; dt++) {
+        const t = (t0 + dt + NT) % NT;
+        const r = Math.round(x * cosT[t] + y * sinT[t]) + D;
+        acc[t * NR + r]++;
+      }
+    }
+    // หายอดของเส้น
+    const minVotes = Math.max(12, Math.min(w, h) * 0.12);
+    const peaks = [];
+    for (let t = 0; t < NT; t++) for (let r = 0; r < NR; r++) {
+      const v = acc[t * NR + r]; if (v < minVotes) continue;
+      let isMax = true;
+      for (let dt = -5; dt <= 5 && isMax; dt++) for (let dr = -6; dr <= 6; dr++) {
+        if (!dt && !dr) continue;
+        const tt = t + dt, rr = r + dr;
+        let vv;
+        if (tt < 0 || tt >= NT) { const t2 = (tt + NT) % NT, r2 = 2 * D - rr; if (r2 < 0 || r2 >= NR) continue; vv = acc[t2 * NR + r2]; }
+        else { if (rr < 0 || rr >= NR) continue; vv = acc[tt * NR + rr]; }
+        if (vv > v || (vv === v && (dt < 0 || (dt === 0 && dr < 0)))) { isMax = false; break; }
+      }
+      if (isMax) peaks.push({ v, c: cosT[t], s: sinT[t], r: r - D, t });
+    }
+    peaks.sort((a, b2) => b2.v - a.v);
+    const horiz = [], vert = [];
+    for (const p of peaks) {
+      if (p.t > 45 && p.t < 135) { if (horiz.length < 14) horiz.push(p); }
+      else if (vert.length < 14) vert.push(p);
+      if (horiz.length >= 14 && vert.length >= 14) break;
+    }
+    if (horiz.length < 2 || vert.length < 2) return null;
+
+    // คะแนนของด้าน = สัดส่วนจุดบนด้านที่มีขอบจริง (ทิศของขอบต้องตั้งฉากกับด้าน)
+    const support = (a, c, t0 = 0.04, t1 = 0.96, N = 48) => {
+      const dx = c[0] - a[0], dy = c[1] - a[1], L = Math.hypot(dx, dy);
+      if (L < 8) return 0;
+      const nx = -dy / L, ny = dx / L; let hit = 0, tot = 0;
+      for (let k = 0; k < N; k++) {
+        const tt = t0 + (t1 - t0) * k / (N - 1), px = a[0] + dx * tt, py = a[1] + dy * tt;
+        if (px < 1 || py < 1 || px > w - 2 || py > h - 2) continue;
+        tot++;
+        for (let o = -2; o <= 2; o++) {
+          const x = Math.round(px + nx * o), y = Math.round(py + ny * o); if (x < 1 || y < 1 || x > w - 2 || y > h - 2) continue;
+          const i = y * w + x;
+          if (edge[i] && Math.abs(Math.cos(ang[i]) * nx + Math.sin(ang[i]) * ny) > 0.88) { hit++; break; }
+        }
+      }
+      if (t0 < 0 || t1 > 1) return tot < N * 0.4 ? 0 : hit / tot; // ช่วงต่อเลยมุม: นอกภาพถือว่าไม่มีขอบ
+      return tot < N * 0.5 ? 0 : hit / tot;
+    };
+    const yAt = (l, x) => Math.abs(l.s) < 1e-6 ? Infinity : (l.r - x * l.c) / l.s;
+    const xAt = (l, y) => Math.abs(l.c) < 1e-6 ? Infinity : (l.r - y * l.s) / l.c;
+    const supCache = new Map();
+    let best = null;
+    for (let i = 0; i < horiz.length; i++) for (let j = i + 1; j < horiz.length; j++) {
+      let top = horiz[i], bot = horiz[j];
+      if (yAt(top, w / 2) > yAt(bot, w / 2)) [top, bot] = [bot, top];
+      if (yAt(bot, w / 2) - yAt(top, w / 2) < h * 0.15) continue;
+      for (let k = 0; k < vert.length; k++) for (let m = k + 1; m < vert.length; m++) {
+        let lef = vert[k], rig = vert[m];
+        if (xAt(lef, h / 2) > xAt(rig, h / 2)) [lef, rig] = [rig, lef];
+        if (xAt(rig, h / 2) - xAt(lef, h / 2) < w * 0.15) continue;
+        const q = [lineIntersect(top, lef), lineIntersect(top, rig), lineIntersect(bot, rig), lineIntersect(bot, lef)];
+        if (q.some(p => !p || p[0] < -w * 0.04 || p[0] > w * 1.04 || p[1] < -h * 0.04 || p[1] > h * 1.04)) continue;
+        const area = polyArea(q), ratio = area / (w * h);
+        if (ratio < 0.1) continue;
+        let ok = true;
+        for (let c = 0; c < 4 && ok; c++) {
+          const a = q[(c + 3) % 4], p = q[c], n2 = q[(c + 1) % 4];
+          const v1 = [a[0] - p[0], a[1] - p[1]], v2 = [n2[0] - p[0], n2[1] - p[1]];
+          const cs = (v1[0] * v2[0] + v1[1] * v2[1]) / (Math.hypot(...v1) * Math.hypot(...v2));
+          if (Math.abs(cs) > 0.6) ok = false;          // มุมราว 53°–127°
+          if (cross(a, p, n2) * cross(q[3], q[0], q[1]) <= 0) ok = false; // ต้องนูน
+        }
+        if (!ok) continue;
+        const sides = [[q[0], q[1]], [q[1], q[2]], [q[2], q[3]], [q[3], q[0]]];
+        let prod = 1, minS = 1;
+        for (const [a, c] of sides) {
+          const key = a.map(Math.round).join() + '|' + c.map(Math.round).join();
+          let sv = supCache.get(key); if (sv === undefined) { sv = support(a, c); supCache.set(key, sv); }
+          prod *= sv; if (sv < minS) minS = sv;
+        }
+        if (minS < 0.4) continue;
+        // ขอบกระดาษจริงจะ "จบที่มุม" ถ้าเส้นยังยาวต่อเลยมุมออกไป (เช่นขอบโต๊ะ) ให้ลดคะแนน
+        let ext = 0;
+        for (const [a, c] of sides) ext += support(a, c, -0.14, -0.03, 16) + support(a, c, 1.03, 1.14, 16);
+        let score = prod * (1 - 0.6 * ext / 8) * Math.pow(ratio, 0.1);
+        // กล้องสด: ให้คะแนนพิเศษกับกรอบที่ใกล้กรอบเดิม กรอบจะได้ไม่กระโดดไปมา
+        if (prev && q.every((p, i) => Math.hypot(p[0] / w - prev[i].x, p[1] / h - prev[i].y) < 0.03)) score *= 1.35;
+        if (!best || score > best.score) best = { score, q, minS };
+      }
+    }
+    if (!best || best.score < 0.12) return null;
+    return { corners: best.q.map(([x, y]) => ({ x: x / w, y: y / h })), score: best.score };
+  }
+
+  function detect(canvas, opts) {
+    opts = opts || {};
+    const L = detectLines(canvas, opts.fast ? 300 : 400, opts.prev);
+    if (L) {
+      const c = opts.fast ? L.corners : snapEdges(canvas, L.corners);
+      return c.map(p => ({ x: Math.min(1, Math.max(0, p.x)), y: Math.min(1, Math.max(0, p.y)) }));
+    }
+    if (opts.fast) return null;
+    return detectRegion(canvas);
+  }
+
+  // วิธีสำรอง: หาพื้นที่ที่ถูกขอบล้อมรอบ / พื้นที่สว่าง
+  function detectRegion(canvas) {
     const { g, w, h } = grayOf(canvas, DET);
     const b = blur(blur(g, w, h), w, h);
 
@@ -249,7 +396,7 @@
     if (!cands.length) return null;
     cands.sort((a, b2) => b2.score - a.score);
     const norm = cands[0].quad.map(([x, y]) => ({ x: x / w, y: y / h }));
-    return snapEdges(canvas, norm).map(p => ({ x: Math.min(1, Math.max(0, p.x)), y: Math.min(1, Math.max(0, p.y)) }));
+    return snapEdges(canvas, norm, 0.03).map(p => ({ x: Math.min(1, Math.max(0, p.x)), y: Math.min(1, Math.max(0, p.y)) }));
   }
 
   function fitLine(pts) {
@@ -264,7 +411,7 @@
   }
 
   // ดูดแต่ละด้านเข้าหาขอบจริงบนภาพความละเอียดสูงขึ้น (หาจุดที่ความสว่างเปลี่ยนมากที่สุดตามแนวตั้งฉาก)
-  function snapEdges(canvas, corners) {
+  function snapEdges(canvas, corners, rFrac) {
     const { g, w, h } = grayOf(canvas, 1200);
     const b = blur(g, w, h);
     const at = (x, y) => {
@@ -275,7 +422,7 @@
     };
     const q = corners.map(p => [p.x * w, p.y * h]);
     const cx = (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4, cy = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4;
-    const R = Math.max(6, Math.round(Math.max(w, h) * 0.03));
+    const R = Math.max(5, Math.round(Math.max(w, h) * (rFrac || 0.015)));
     const lines = [];
     for (let i = 0; i < 4; i++) {
       const a = q[i], c = q[(i + 1) % 4], dx = c[0] - a[0], dy = c[1] - a[1], L = Math.hypot(dx, dy);
@@ -285,14 +432,21 @@
       let pts = [];
       for (let k = 0; k <= 40; k++) {
         const t = 0.08 + 0.84 * k / 40, px = a[0] + dx * t, py = a[1] + dy * t;
-        let best = 0, bs = 0;
+        const prof = [];
+        let best = 0;
         for (let s2 = -R; s2 <= R; s2++) {
           const x = px + nx * s2, y = py + ny * s2;
-          if (x < 1 || y < 1 || x > w - 2 || y > h - 2) continue;
-          const d = Math.abs(at(x + nx, y + ny) - at(x - nx, y - ny));
-          if (d > best) { best = d; bs = s2; }
+          const d = (x < 1 || y < 1 || x > w - 2 || y > h - 2) ? 0 : Math.abs(at(x + nx, y + ny) - at(x - nx, y - ny));
+          prof.push(d); if (d > best) best = d;
         }
-        if (best > 6) pts.push([px + nx * bs, py + ny * bs]);
+        // เลือกยอดที่ใกล้เส้นเดิมที่สุด (ที่แรงพอ) ไม่ใช่ยอดที่แรงที่สุด เพื่อไม่ให้กระโดดไปติดลายในเอกสาร
+        let bs = null;
+        for (let k2 = 1; k2 < prof.length - 1; k2++) {
+          const d = prof[k2];
+          if (d < 4 || d < best * 0.35 || d < prof[k2 - 1] || d < prof[k2 + 1]) continue;
+          const s2 = k2 - R; if (bs === null || Math.abs(s2) < Math.abs(bs)) bs = s2;
+        }
+        if (bs !== null) pts.push([px + nx * bs, py + ny * bs]);
       }
       if (pts.length < 8) { lines.push(null); continue; }
       let ln = fitLine(pts);
@@ -564,5 +718,10 @@
     return c;
   }
 
-  window.Scan = { loadImage, detect, defaultCorners, fullCorners, warp, applyFilter, rotate, scaleTo, toBlob, render, makeCanvas };
+  // ปรับมุมที่ได้จากกล้องสดให้ตรงขอบบนภาพความละเอียดเต็ม
+  function snap(canvas, corners) {
+    return snapEdges(canvas, corners, 0.015).map(p => ({ x: Math.min(1, Math.max(0, p.x)), y: Math.min(1, Math.max(0, p.y)) }));
+  }
+
+  window.Scan = { snap, loadImage, detect, defaultCorners, fullCorners, warp, applyFilter, rotate, scaleTo, toBlob, render, makeCanvas };
 })();

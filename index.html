@@ -38,6 +38,28 @@
   </footer>
 </section>
 
+<!-- ===== จอกล้อง (จับขอบเอกสารสด) ===== -->
+<section id="screen-camera" class="screen">
+  <div class="cam-top">
+    <button id="cam-close" class="cam-btn" aria-label="ปิดกล้อง">✕</button>
+    <button id="cam-auto" class="cam-pill on">อัตโนมัติ</button>
+    <button id="cam-system" class="cam-btn" aria-label="ใช้กล้องของระบบ">📷</button>
+  </div>
+  <div class="cam-view" id="cam-view">
+    <video id="cam-video" playsinline muted autoplay></video>
+    <canvas id="cam-overlay"></canvas>
+    <div id="cam-flash" class="cam-flash"></div>
+    <div id="cam-hint" class="cam-hint">เล็งกล้องให้เห็นกระดาษทั้งแผ่น</div>
+  </div>
+  <div class="cam-bottom">
+    <button id="cam-thumb-btn" class="cam-thumb" aria-label="ดูหน้าที่ถ่าย">
+      <img id="cam-thumb" alt=""><span id="cam-count" class="cam-count" hidden>0</span>
+    </button>
+    <button id="cam-shutter" class="shutter" aria-label="ถ่ายภาพ"><span></span></button>
+    <button id="cam-done" class="cam-done">เสร็จ</button>
+  </div>
+</section>
+
 <!-- ===== จอปรับขอบ ===== -->
 <section id="screen-crop" class="screen">
   <header class="topbar">

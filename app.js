@@ -316,7 +316,7 @@
     $('edit-rotate').onclick = () => { if (!edit) return; edit.page.rotation = ((edit.page.rotation || 0) + 90) % 360; refreshPreview(); };
     $('edit-back').onclick = () => openCrop();
     $('edit-done').onclick = commitEdit;
-    $('edit-more').onclick = () => { $('file-camera').click(); commitEdit(); };
+    $('edit-more').onclick = async () => { await commitEdit(); openCamera(); };
     $('edit-delete').onclick = async () => {
       if (edit.isNew) { edit = null; show('screen-list'); return; }
       if (!confirm('ลบหน้านี้?')) return;
@@ -326,6 +326,183 @@
       if (state.urls.has(id)) { URL.revokeObjectURL(state.urls.get(id)); state.urls.delete(id); }
       edit = null; renderList(); show('screen-list'); toast('ลบหน้าแล้ว');
     };
+  }
+
+  /* ---------- กล้องในแอป: แสดงกรอบเอกสารสด + ถ่ายอัตโนมัติ ---------- */
+  const cam = {
+    stream: null, running: false, timer: null, small: null,
+    smooth: null, miss: 0, hist: [], cooldown: false, capturedQ: null, capturing: false,
+    queue: Promise.resolve(), pending: 0, count: 0, auto: true, thumbUrl: null,
+  };
+  try { cam.auto = localStorage.getItem('scanner.auto') !== '0'; } catch (e) { /* ใช้ค่าเริ่มต้น */ }
+
+  function openCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { $('file-camera').click(); return; }
+    show('screen-camera');
+    cam.count = 0; cam.smooth = null; cam.hist = []; cam.cooldown = false;
+    if (cam.thumbUrl) { URL.revokeObjectURL(cam.thumbUrl); cam.thumbUrl = null; }
+    $('cam-thumb').removeAttribute('src');
+    updateCamUI();
+    startStream();
+  }
+  async function startStream() {
+    stopStream();
+    setHint('กำลังเปิดกล้อง…');
+    try {
+      cam.stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 4032 }, height: { ideal: 3024 } },
+      });
+    } catch (err) {
+      console.warn(err);
+      setHint('เปิดกล้องในแอปไม่ได้ — กดปุ่ม 📷 มุมขวาบนเพื่อใช้กล้องของระบบ');
+      return;
+    }
+    if (!$('screen-camera').classList.contains('active')) { stopStream(); return; }
+    const v = $('cam-video');
+    v.srcObject = cam.stream;
+    try { await v.play(); } catch (e) { /* autoplay จะเล่นเองเมื่อพร้อม */ }
+    cam.running = true;
+    setHint('เล็งกล้องให้เห็นกระดาษทั้งแผ่น');
+    camLoop();
+  }
+  function stopStream() {
+    cam.running = false;
+    clearTimeout(cam.timer);
+    if (cam.stream) { cam.stream.getTracks().forEach(t => t.stop()); cam.stream = null; }
+    const v = $('cam-video'); if (v) v.srcObject = null;
+  }
+  function setHint(text, good) {
+    const el = $('cam-hint'); el.textContent = text; el.classList.toggle('good', !!good);
+  }
+  function updateCamUI() {
+    $('cam-count').hidden = cam.count === 0;
+    $('cam-count').textContent = cam.count;
+    $('cam-auto').classList.toggle('on', cam.auto);
+    $('cam-auto').textContent = cam.auto ? 'ถ่ายอัตโนมัติ: เปิด' : 'ถ่ายอัตโนมัติ: ปิด';
+    $('cam-done').textContent = cam.count ? 'เสร็จ (' + cam.count + ')' : 'เสร็จ';
+    $('cam-shutter').classList.toggle('busy', cam.pending > 0);
+  }
+
+  function camLoop() {
+    if (!cam.running) return;
+    const v = $('cam-video');
+    if (v.readyState >= 2 && v.videoWidth) {
+      const s = 360 / Math.max(v.videoWidth, v.videoHeight);
+      const w = Math.round(v.videoWidth * s), h = Math.round(v.videoHeight * s);
+      if (!cam.small || cam.small.width !== w || cam.small.height !== h) cam.small = Scan.makeCanvas(w, h);
+      cam.small.getContext('2d', { willReadFrequently: true }).drawImage(v, 0, 0, w, h);
+      let q = null;
+      try { q = Scan.detect(cam.small, { fast: true, prev: cam.smooth }); } catch (e) { console.warn(e); }
+      handleDetection(q);
+    }
+    cam.timer = setTimeout(camLoop, 80);
+  }
+
+  const qDist = (a, b) => Math.max(...a.map((p, i) => Math.hypot(p.x - b[i].x, p.y - b[i].y)));
+
+  function handleDetection(q) {
+    const now = performance.now();
+    if (q) {
+      cam.miss = 0;
+      cam.smooth = !cam.smooth || qDist(cam.smooth, q) > 0.08 ? q.map(p => ({ ...p }))
+        : cam.smooth.map((p, i) => ({ x: p.x * 0.45 + q[i].x * 0.55, y: p.y * 0.45 + q[i].y * 0.55 }));
+      cam.hist.push({ t: now, q });
+      while (cam.hist.length && now - cam.hist[0].t > 1100) cam.hist.shift();
+    } else if (++cam.miss > 4) {
+      cam.smooth = null; cam.hist = []; cam.cooldown = false;
+    }
+    // ปลดล็อกการถ่ายอัตโนมัติเมื่อเปลี่ยนไปหน้าใหม่ (กรอบขยับไปมาก)
+    if (cam.cooldown && cam.smooth && cam.capturedQ && qDist(cam.smooth, cam.capturedQ) > 0.1) cam.cooldown = false;
+
+    let stable = false;
+    if (cam.smooth && cam.hist.length >= 6 && now - cam.hist[0].t > 800) {
+      const last = cam.hist[cam.hist.length - 1].q;
+      const near = cam.hist.filter(hh => qDist(hh.q, last) < 0.02).length;
+      stable = near >= cam.hist.length * 0.8;
+    }
+    drawOverlay(stable);
+
+    if (!cam.smooth) setHint('เล็งกล้องให้เห็นกระดาษทั้งแผ่น');
+    else if (cam.cooldown) setHint('ถ่ายแล้ว ✓ เปลี่ยนหน้าถัดไปได้เลย', true);
+    else if (!cam.auto) setHint('พบเอกสารแล้ว กดปุ่มถ่ายภาพ', true);
+    else if (stable) setHint('กำลังถ่าย…', true);
+    else setHint('พบเอกสารแล้ว ถือนิ่ง ๆ', true);
+
+    if (cam.auto && stable && !cam.cooldown && !cam.capturing) capture(true);
+  }
+
+  function drawOverlay(stable) {
+    const cv = $('cam-overlay'), v = $('cam-video'), r = cv.getBoundingClientRect();
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    if (cv.width !== Math.round(r.width * dpr) || cv.height !== Math.round(r.height * dpr)) {
+      cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr);
+    }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, r.width, r.height);
+    if (!cam.smooth || !v.videoWidth) return;
+    const s = Math.min(r.width / v.videoWidth, r.height / v.videoHeight);
+    const dw = v.videoWidth * s, dh = v.videoHeight * s, ox = (r.width - dw) / 2, oy = (r.height - dh) / 2;
+    const pts = cam.smooth.map(p => [ox + p.x * dw, oy + p.y * dh]);
+    ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath();
+    ctx.fillStyle = stable ? 'rgba(30, 200, 120, .28)' : 'rgba(61, 127, 224, .28)'; ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = stable ? '#2ee59d' : '#4d9bff'; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    pts.forEach(p => { ctx.beginPath(); ctx.arc(p[0], p[1], 5, 0, 7); ctx.fill(); });
+  }
+
+  function capture(auto) {
+    const v = $('cam-video');
+    if (cam.capturing || !v.videoWidth) return;
+    cam.capturing = true;
+    const s = Math.min(1, 3000 / Math.max(v.videoWidth, v.videoHeight));
+    const frameCanvas = Scan.makeCanvas(v.videoWidth * s, v.videoHeight * s);
+    const fctx = frameCanvas.getContext('2d'); fctx.imageSmoothingQuality = 'high';
+    fctx.drawImage(v, 0, 0, frameCanvas.width, frameCanvas.height);
+    const fl = $('cam-flash'); fl.classList.add('go'); setTimeout(() => fl.classList.remove('go'), 60);
+    if (navigator.vibrate) try { navigator.vibrate(30); } catch (e) { /* ไม่รองรับ */ }
+
+    const live = cam.smooth ? cam.smooth.map(p => ({ ...p })) : null;
+    cam.cooldown = true; cam.capturedQ = live; cam.hist = [];
+    cam.count++; cam.pending++; updateCamUI();
+    cam.queue = cam.queue.then(async () => {
+      await frame();
+      const corners = live ? Scan.snap(frameCanvas, live) : (Scan.detect(frameCanvas) || Scan.fullCorners());
+      const page = { id: uid(), corners, filter: DEFAULT_FILTER, rotation: 0 };
+      const out = await Scan.render(frameCanvas, page);
+      await savePage(page, frameCanvas, out, true);
+      const rec = state.pages.get(page.id);
+      if (cam.thumbUrl) URL.revokeObjectURL(cam.thumbUrl);
+      cam.thumbUrl = URL.createObjectURL(rec.thumb); $('cam-thumb').src = cam.thumbUrl;
+    }).catch(err => { console.error(err); cam.count--; toast('บันทึกภาพไม่สำเร็จ'); })
+      .finally(() => { cam.pending--; updateCamUI(); });
+    setTimeout(() => { cam.capturing = false; }, auto ? 900 : 400);
+  }
+
+  async function closeCamera() {
+    stopStream();
+    if (cam.pending) { busy(true, 'กำลังบันทึกหน้าที่ถ่าย…'); await cam.queue; busy(false); }
+    renderList(); show('screen-list');
+    if (cam.count) toast('เพิ่ม ' + cam.count + ' หน้าแล้ว แตะที่หน้าเพื่อปรับขอบหรือฟิลเตอร์');
+  }
+
+  function initCameraEvents() {
+    $('cam-close').onclick = closeCamera;
+    $('cam-done').onclick = closeCamera;
+    $('cam-thumb-btn').onclick = closeCamera;
+    $('cam-shutter').onclick = () => capture(false);
+    $('cam-auto').onclick = () => {
+      cam.auto = !cam.auto; cam.hist = [];
+      try { localStorage.setItem('scanner.auto', cam.auto ? '1' : '0'); } catch (e) { /* ไม่เป็นไร */ }
+      updateCamUI();
+    };
+    // ใช้กล้องของระบบ (สำรอง) — ต้องเรียก click ทันทีในจังหวะที่ผู้ใช้แตะ
+    $('cam-system').onclick = () => { $('file-camera').click(); closeCamera(); };
+    document.addEventListener('visibilitychange', () => {
+      if (!$('screen-camera').classList.contains('active')) return;
+      if (document.hidden) stopStream(); else startStream();
+    });
   }
 
   /* ---------- ส่งออก PDF ---------- */
@@ -388,7 +565,8 @@
 
   /* ---------- เริ่มต้น ---------- */
   async function init() {
-    $('btn-camera').onclick = () => $('file-camera').click();
+    $('btn-camera').onclick = () => openCamera();
+    initCameraEvents();
     $('btn-gallery').onclick = () => $('file-gallery').click();
     $('file-camera').onchange = e => { const f = e.target.files; if (f && f.length) importFiles(f, true); e.target.value = ''; };
     $('file-gallery').onchange = e => { const f = e.target.files; if (f && f.length) importFiles(f, true); e.target.value = ''; };
@@ -416,6 +594,6 @@
   }
 
   // เปิดให้ทดสอบจากคอนโซล
-  window.ScannerApp = { importFiles, state };
+  window.ScannerApp = { importFiles, state, cam: () => cam, handleDetection: q => handleDetection(q), capture: a => capture(a) };
   init();
 })();

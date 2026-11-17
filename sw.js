@@ -1,6 +1,6 @@
 /* sw.js — แคชไฟล์ทั้งหมดไว้ในเครื่อง เพื่อให้ใช้งานได้โดยไม่ต้องต่อเน็ต
    เมื่อแก้ไฟล์ใด ๆ ให้เพิ่มเลข VERSION เพื่อให้มือถือโหลดของใหม่ */
-const VERSION = 'v1';
+const VERSION = 'v2';
 const CACHE = 'scanner-' + VERSION;
 const FILES = [
   './',
